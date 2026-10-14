@@ -8,6 +8,8 @@ tldr; baa lives in your menu bar, tells you when your mac is about to run out of
 
 <img src="docs/demo.gif" width="560" alt="baa: open the menu bar panel, shear the leftovers, RAM goes from 9% to 63% free">
 
+if you like **baa**, i’d love a star ⭐️😄
+
 ## why
 
 turns out most of my RAM wasn't going to apps i had open. it was mostly dev servers, builds and agent leftovers i'd forgotten about.
