@@ -23,6 +23,7 @@ turns out most of my RAM wasn't going to apps i had open. it was mostly dev serv
   - 👻 apps and scripts that should've closed but didn't
   - 🤖 things ai agents started and forgot about
   - 💤 big stuff just sitting there idle (agent sessions idle for hours, docker with no containers, an ollama model still loaded)
+  - 🔥 leftovers stuck burning cpu (spinning your fans and draining battery)
 - tells you how much RAM you'd get back, and frees it in one click
 - pings you a few minutes before you run out
 - also finds dev junk filling up your disk (old builds, package caches etc.) and trashes it in one click
@@ -83,6 +84,7 @@ basically baa looks for stuff that's still running but not doing anything:
 - its app or terminal is closed but it's still going
 - an ai agent started it and it's been sitting idle for 15+ min
 - it's big and hasn't used any cpu in a while
+- it's been stuck using half a core or more for 5+ min, and whatever started it is gone (or it's an agent that's been idle 15+ min)
 
 it also watches memory pressure (the green / yellow / red graph in activity monitor), not just how much RAM is used. macs use most of their RAM all the time and that's usually ok!
 

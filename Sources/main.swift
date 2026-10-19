@@ -42,7 +42,7 @@ func size(_ b: Double) -> String {
 
 struct Proc {
     let pid: Int, ppid: Int, uid: Int, rssKB: Int
-    let elapsed: Double, cpu: Double
+    let elapsed: Double, cpu: Double, pcpu: Double
     let exe: String, cmd: String
     var label = ""
     var bytes = 0.0
@@ -115,11 +115,12 @@ func readProcs() -> [Int: Proc] {
         exe[pid] = String(t[sp...].drop(while: { $0 == " " }))
     }
     var out: [Int: Proc] = [:]
-    for line in run("/bin/ps", ["-axww", "-o", "pid=,ppid=,uid=,rss=,etime=,time=,command="]).out.split(separator: "\n") {
-        let f = line.split(separator: " ", maxSplits: 6, omittingEmptySubsequences: true)
-        guard f.count == 7, let pid = Int(f[0]), let ppid = Int(f[1]), let uid = Int(f[2]), let rss = Int(f[3]) else { continue }
-        let e = exe[pid] ?? String(f[6])
-        var p = Proc(pid: pid, ppid: ppid, uid: uid, rssKB: rss, elapsed: secs(f[4]), cpu: secs(f[5]), exe: e, cmd: String(f[6]))
+    for line in run("/bin/ps", ["-axww", "-o", "pid=,ppid=,uid=,rss=,etime=,time=,%cpu=,command="]).out.split(separator: "\n") {
+        let f = line.split(separator: " ", maxSplits: 7, omittingEmptySubsequences: true)
+        guard f.count == 8, let pid = Int(f[0]), let ppid = Int(f[1]), let uid = Int(f[2]), let rss = Int(f[3]) else { continue }
+        let e = exe[pid] ?? String(f[7])
+        var p = Proc(pid: pid, ppid: ppid, uid: uid, rssKB: rss, elapsed: secs(f[4]), cpu: secs(f[5]),
+                     pcpu: Double(f[6]) ?? 0, exe: e, cmd: String(f[7]))
         p.label = label(e, p.cmd)
         p.bytes = footprint(pid) ?? Double(rss) * 1024
         out[pid] = p
@@ -141,12 +142,12 @@ func hint(_ p: Proc) -> String? {
 
 // MARK: - findings
 
-enum Kind { case ghost, agent, idle }
+enum Kind { case ghost, agent, idle, hot }
 enum Fix { case kill([Int]), quit(String), run(String, [String]) }
 
 struct Finding: Identifiable {
     let id: String, kind: Kind, title: String, detail: String, bytes: Double, fix: Fix
-    var freeLabel: String { "Free \(size(bytes))" }
+    var freeLabel: String { kind == .hot ? "Stop" : "Free \(size(bytes))" }
 }
 
 struct Scan {
@@ -158,6 +159,8 @@ struct Scan {
 final class Engine {
     // per-pid cpu history, so "idle" means "hasn't used CPU lately", not just "low right now"
     private var seen: [Int: (cpu: Double, at: Date, active: Date, born: Date)] = [:]
+    // when each pid started burning CPU (>= half a core), to catch runaways that never go idle
+    private var hotSince: [Int: Date] = [:]
     private let me = Int(getuid())
 
     private func idle(_ p: Proc, _ now: Date) -> Double {
@@ -212,6 +215,7 @@ final class Engine {
         let now = Date()
         let procs = readProcs()
         seen = seen.filter { procs[$0.key] != nil }
+        hotSince = hotSince.filter { procs[$0.key] != nil }
 
         var kids: [Int: [Int]] = [:]
         for p in procs.values where p.pid != p.ppid { kids[p.ppid, default: []].append(p.pid) }
@@ -221,8 +225,16 @@ final class Engine {
             return out
         }
         let mine = procs.values.filter { $0.uid == me }.sorted { $0.pid < $1.pid }
-        var idleOf: [Int: Double] = [:]
-        for p in mine { idleOf[p.pid] = idle(p, now) }
+        var idleOf: [Int: Double] = [:], hotFor: [Int: Double] = [:]
+        for p in mine {
+            let first = seen[p.pid] == nil
+            idleOf[p.pid] = idle(p, now)
+            if p.pcpu >= 50 {
+                // first sighting (eg `baa --now`): trust its lifetime average instead of waiting
+                let since = hotSince[p.pid] ?? (first && p.cpu / max(p.elapsed, 1) >= 0.5 ? now.addingTimeInterval(-p.elapsed) : now)
+                hotSince[p.pid] = since; hotFor[p.pid] = now.timeIntervalSince(since)
+            } else { hotSince[p.pid] = nil }
+        }
         func treeIdle(_ pids: [Int]) -> Double { pids.compactMap { idleOf[$0] }.min() ?? 0 }
         func treeBytes(_ pids: [Int]) -> Double { pids.compactMap { procs[$0]?.bytes }.reduce(0, +) }
 
@@ -234,7 +246,7 @@ final class Engine {
         var found: [Finding] = []
         func add(_ id: String, _ kind: Kind, _ title: String, _ detail: String, _ pids: [Int], fix: Fix? = nil) {
             let pids = pids.filter { !claimed.contains($0) && procs[$0]?.uid == me }
-            guard !pids.isEmpty, treeBytes(pids) >= 50 * 1_048_576 else { return }
+            guard !pids.isEmpty, kind == .hot || treeBytes(pids) >= 50 * 1_048_576 else { return }
             claimed.formUnion(pids)
             found.append(Finding(id: id, kind: kind, title: title, detail: detail, bytes: treeBytes(pids), fix: fix ?? .kill(pids)))
         }
@@ -326,8 +338,24 @@ final class Engine {
                 "idle \(dur(i)) · pick it back up later with \(resume)", pids)
         }
 
-        // orphans: reparented to launchd because the terminal / agent that started them closed
+        // runaways: leftovers stuck burning CPU (fans + battery), which never look idle so the checks below miss them
         let launchd = launchdPIDs()
+        for p in mine where (hotFor[p.pid] ?? 0) >= mins(5) && !claimed.contains(p.pid) && !shells.contains(p.base)
+                            && !agentLabels.contains(p.label) && !systemish(p) {
+            // climb to the top of the job (eg npm -> node -> esbuild), stopping at a shell, agent, app or launchd
+            var top = p
+            while let q = procs[top.ppid], q.pid > 1, q.uid == me, !shells.contains(q.base), !agentLabels.contains(q.label), !systemish(q) { top = q }
+            let orphan = top.ppid == 1 && !launchd.contains(top.pid)
+            let root = agentRoot(top), quiet = root.flatMap { idleOf[$0.pid] } ?? 0
+            // a terminal you still have open is your call, and so is the agent you ran baa from
+            guard orphan || (root != nil && !claimed.contains(root!.pid) && quiet >= mins(15)) else { continue }
+            let pids = tree(top.pid), load = pids.compactMap { procs[$0]?.pcpu }.reduce(0, +)
+            let by = orphan ? "its terminal or agent closed" : "started by \(who(root!)), idle \(dur(quiet))"
+            add("hot-\(top.pid)", .hot, top.label + (hint(top).map { " · \($0)" } ?? ""),
+                "\(Int(load.rounded()))% CPU for \(dur(hotFor[p.pid]!)) · \(by)", pids)
+        }
+
+        // orphans: reparented to launchd because the terminal / agent that started them closed
         for p in mine where p.ppid == 1 && !claimed.contains(p.pid) && !launchd.contains(p.pid) && !systemish(p) {
             if p.base.hasPrefix("tmux") || p.base.hasPrefix("screen") { continue }
             let pids = tree(p.pid).filter { !claimed.contains($0) }
@@ -744,11 +772,11 @@ final class Model: ObservableObject {
     // big leftovers get one heads-up every 6h, even when RAM is fine
     private func ghostPing() {
         let now = Date()
-        guard let f = scan.findings.first(where: { $0.kind != .idle && $0.bytes >= 1_073_741_824 &&
+        guard let f = scan.findings.first(where: { ($0.kind == .hot || ($0.kind != .idle && $0.bytes >= 1_073_741_824)) &&
                                                    ghostPings[$0.id].map { now.timeIntervalSince($0) > 6 * 3600 } ?? true }) else { return }
         ghostPings[f.id] = now
         UserDefaults.standard.set(ghostPings.mapValues(\.timeIntervalSince1970), forKey: "ghostPings")
-        Notifier.shared.post("👻 \(size(f.bytes)) still running", f.title, f.detail, button: f.freeLabel) { self.free(f.id) }
+        Notifier.shared.post(f.kind == .hot ? "🔥 stuck burning CPU" : "👻 \(size(f.bytes)) still running", f.title, f.detail, button: f.freeLabel) { self.free(f.id) }
     }
 
     private func test() {
@@ -988,11 +1016,11 @@ extension Finding {
     var culprit: String {
         if let r = detail.range(of: "started by ") {
             let rest = detail[r.upperBound...]
-            return String(rest.prefix { $0 != "(" && $0 != "·" }).trimmingCharacters(in: .whitespaces)
+            return String(rest.prefix { $0 != "(" && $0 != "·" && $0 != "," }).trimmingCharacters(in: .whitespaces)
         }
         return kind == .idle ? "Sitting idle" : "Left behind"
     }
-    var emoji: String { kind == .ghost ? "👻" : kind == .agent ? "🤖" : "💤" }
+    var emoji: String { kind == .hot ? "🔥" : kind == .ghost ? "👻" : kind == .agent ? "🤖" : "💤" }
 }
 
 func appIcon(_ name: String) -> NSImage? {
@@ -1193,7 +1221,7 @@ struct MenuView: View {
             ForEach(groups, id: \.who) { g in
                 VStack(alignment: .leading, spacing: 6) {
                     let n = g.items.count, total = size(g.items.reduce(0) { $0 + $1.bytes })
-                    Text(g.items[0].kind == .agent ? "\(g.who) left \(n == 1 ? "this" : "these") · \(total)" : "\(g.who) · \(total)")
+                    Text(g.items[0].detail.contains("started by ") ? "\(g.who) left \(n == 1 ? "this" : "these") · \(total)" : "\(g.who) · \(total)")
                         .font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
                     ForEach(g.items) { f in
                         HStack(alignment: .center, spacing: 10) {
@@ -1337,7 +1365,7 @@ enum CLI {
         } else {
             print("  \(b)leftovers\(r)  \(g)· \(size(s.freeable)) you can free\(r)")
             for f in s.findings {
-                let icon = f.kind == .ghost ? "👻" : f.kind == .agent ? "🤖" : "💤"
+                let icon = f.emoji
                 print("  \(icon) \(b)\(f.title)\(r)  \(c)\(size(f.bytes))\(r)")
                 print("     \(g)\(f.detail)\(r)")
                 print("     \(g)→ baa free \(f.id)\(r)")
@@ -1482,7 +1510,7 @@ enum CLI {
         let s = Engine().scan()
         let fs = id == "all" ? s.findings : s.findings.filter { $0.id == id }
         guard !fs.isEmpty else { print("nothing called '\(id)' right now. run baa to see ids"); return }
-        for f in fs { apply(f, wait: true); print("freed \(size(f.bytes)) · \(f.title)") }
+        for f in fs { apply(f, wait: true); print(f.kind == .hot ? "stopped \(f.title)" : "freed \(size(f.bytes)) · \(f.title)") }
     }
 }
 

@@ -1,7 +1,7 @@
 class Baa < Formula
   desc "Tiny ram for your RAM: menu bar app that frees what your dev tools left running"
   homepage "https://github.com/selviarora/baa"
-  url "https://github.com/selviarora/baa.git", tag: "v1.2.0"
+  url "https://github.com/selviarora/baa.git", tag: "v1.3.0"
   license "MIT"
 
   depends_on macos: :sonoma
