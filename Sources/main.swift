@@ -413,6 +413,7 @@ enum JunkAction { case trash([URL]), run([(String, [String])]) }
 struct Junk: Identifiable {
     let id: String, icon: String, title: String, detail: String, bytes: Double, action: JunkAction
     var blockedBy: String? = nil
+    var pingable = true   // cheap to rebuild, so the disk-full ping may offer it as a one-click clear
     var trashes: Bool { if case .trash = action { return true }; return false }
 }
 
@@ -508,7 +509,17 @@ enum Disk {
             [h("Library/Caches/Homebrew"), h("Library/Caches/CocoaPods"), h("Library/Caches/org.swift.swiftpm")])
         add("test-browsers", "🧪", "Test browsers (Playwright / Puppeteer)", "reinstall with npx playwright install",
             [h("Library/Caches/ms-playwright"), h(".cache/puppeteer")])
-        add("hf", "🤗", "Hugging Face models", "download again if a script needs them", [h(".cache/huggingface/hub")])
+        // models: only ones you haven't opened in 2 weeks. if one comes back after a clean, an app needs it, so leave it alone
+        let cleaned = Set(UserDefaults.standard.stringArray(forKey: "cleanedModels") ?? [])
+        let models = children(h(".cache/huggingface/hub")).filter { m in
+            m.lastPathComponent.hasPrefix("models--") && !cleaned.contains(m.lastPathComponent) &&
+            run("/usr/bin/find", [m.path, "-type", "f", "-atime", "-14", "-print", "-quit"]).out.isEmpty
+        }
+        let before = out.count
+        add("hf", "🤗", "Unused Hugging Face models",
+            "\(models.count) not opened in 2+ weeks · " + models.prefix(2).map { $0.lastPathComponent.components(separatedBy: "--").last ?? "" }.joined(separator: ", "),
+            models)
+        if out.count > before { out[out.count - 1].pingable = false }
 
         // installers sitting in Downloads for over a week
         let weekAgo = Date().addingTimeInterval(-7 * 86400)
@@ -539,11 +550,115 @@ enum Disk {
         return out.sorted { $0.bytes > $1.bytes }
     }
 
+    // biggest folders in your home (Library and hidden folders split out), for when the junk list can't explain a full disk
+    static func space() -> [(url: URL, bytes: Double)] {
+        let skip: Set<String> = ["Library", ".Trash"]
+        var dirs = children(home).filter { !skip.contains($0.lastPathComponent) }
+        dirs += ((try? FileManager.default.contentsOfDirectory(at: home, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.lastPathComponent.hasPrefix(".") && $0.lastPathComponent != ".Trash" }
+        dirs += children(h("Library")) + [h(".Trash")]
+        var out: [(URL, Double)] = []
+        for l in run("/usr/bin/du", ["-skx"] + dirs.map(\.path)).out.split(separator: "\n") {
+            let f = l.split(separator: "\t", maxSplits: 1)
+            guard f.count == 2, let kb = Double(f[0]), kb * 1024 >= 1e9 else { continue }
+            out.append((URL(fileURLWithPath: String(f[1])), kb * 1024))
+        }
+        return out.sorted { $0.1 > $1.1 }.map { (url: $0.0, bytes: $0.1) }
+    }
+
     static func clean(_ j: Junk) {
         switch j.action {
-        case .trash(let urls): for u in urls { try? FileManager.default.trashItem(at: u, resultingItemURL: nil) }
+        case .trash(let urls):
+            for u in urls { try? FileManager.default.trashItem(at: u, resultingItemURL: nil) }
+            if j.id == "hf" {
+                let names = (UserDefaults.standard.stringArray(forKey: "cleanedModels") ?? []) + urls.map(\.lastPathComponent)
+                UserDefaults.standard.set(Array(Set(names)), forKey: "cleanedModels")
+            }
         case .run(let cmds): for (path, args) in cmds { run(path, args) }
         }
+    }
+}
+
+// MARK: - ask AI (opt-in)
+
+// what's safe to delete among the big folders rules can't judge. goes through the user's own claude / pi CLI,
+// so there's no key to set up. only folder names + sizes are sent, never file contents, and it never deletes anything
+struct Verdict: Identifiable {
+    let id = UUID()
+    let url: URL, bytes: Double, kind: String, why: String, name: String
+    var chip: String { ["safe": "🟢 safe to delete", "app": "🟡 an app needs it", "yours": "🔵 your files"][kind] ?? "⚪ not sure" }
+}
+
+struct AIError: Error { let msg: String }
+
+enum AI {
+    static func cli() -> (name: String, path: String, args: [String])? {
+        let home = Disk.home.path
+        let options: [(String, [String], [String])] = [
+            ("Claude", [home + "/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude", home + "/.claude/local/claude"],
+             ["-p", "--tools", "", "--model", "sonnet"]),
+            ("pi", ["/opt/homebrew/bin/pi", "/usr/local/bin/pi", home + "/.local/bin/pi"], ["-p", "--no-session", "--no-tools"]),
+        ]
+        for (name, paths, args) in options {
+            if let p = paths.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) { return (name, p, args) }
+        }
+        return nil
+    }
+
+    // the big folders, plus what's inside the ones that aren't obviously yours (Library, hidden folders, Trash).
+    // your own folders (Desktop, Documents, projects) are sent by name only, never what's in them
+    static func folders(_ space: [(url: URL, bytes: Double)]) -> [String: Double] {
+        var out: [String: Double] = [:]
+        let home = Disk.home.path
+        for d in space.prefix(10) {
+            out[d.url.path] = d.bytes
+            let rel = d.url.path.replacingOccurrences(of: home + "/", with: "")
+            guard rel.hasPrefix("Library/") || rel.hasPrefix(".") else { continue }
+            for l in run("/usr/bin/du", ["-kx", "-d", "2", d.url.path]).out.split(separator: "\n") {
+                let f = l.split(separator: "\t", maxSplits: 1)
+                guard f.count == 2, let kb = Double(f[0]), kb * 1024 >= 1e9 else { continue }
+                out[String(f[1])] = kb * 1024
+            }
+        }
+        return out
+    }
+
+    static func ask(_ space: [(url: URL, bytes: Double)]) -> Result<[Verdict], AIError> {
+        guard let c = cli() else { return .failure(AIError(msg: "no claude or pi CLI found")) }
+        let home = Disk.home.path, sizes = folders(space)
+        let lines = sizes.sorted { $0.value > $1.value }.map { "\(size($0.value))\t" + $0.key.replacingOccurrences(of: home, with: "~") }
+        let prompt = """
+        Someone wants to free disk space on their Mac. These are the biggest folders in their home (size, path). \
+        For the most useful paths, say whether deleting it is safe. Reply with ONLY a JSON array, no other text: \
+        [{"path": "~/...", "name": "2-4 plain words, eg Spotify cache", "verdict": "safe" | "app" | "yours" | "unsure", "why": "under 12 words"}]. \
+        safe = caches, build output, logs or old downloads that regenerate or aren't needed. \
+        app = an installed app needs it (its models, data, settings), so deleting breaks it or it downloads again. \
+        yours = the person's own files or projects. unsure = can't tell. \
+        Prefer the most specific path, skip a parent if you judged its children. At most 10 items, biggest first.
+
+        \(lines.joined(separator: "\n"))
+        """
+        let p = Process(); p.executableURL = URL(fileURLWithPath: c.path); p.arguments = c.args + [prompt]
+        p.currentDirectoryURL = FileManager.default.temporaryDirectory
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:\(home)/.local/bin:/usr/bin:/bin:" + (env["PATH"] ?? "")
+        p.environment = env
+        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice; p.standardInput = FileHandle.nullDevice
+        do { try p.run() } catch { return .failure(AIError(msg: "couldn't start \(c.name)")) }
+        let timer = DispatchWorkItem { if p.isRunning { p.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 150, execute: timer)
+        let data = pipe.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit(); timer.cancel()
+        let text = String(decoding: data, as: UTF8.self)
+        guard let a = text.firstIndex(of: "["), let b = text.lastIndex(of: "]"), a < b,
+              let items = try? JSONSerialization.jsonObject(with: Data(text[a...b].utf8)) as? [[String: String]] else {
+            return .failure(AIError(msg: "\(c.name) didn't answer in time, try again"))
+        }
+        return .success(items.compactMap { (i: [String: String]) -> Verdict? in
+            guard let path = i["path"] else { return nil }
+            let full = path.hasPrefix("~") ? home + path.dropFirst() : path
+            return Verdict(url: URL(fileURLWithPath: full), bytes: sizes[full] ?? 0, kind: i["verdict"] ?? "unsure", why: i["why"] ?? "",
+                           name: i["name"] ?? (full.components(separatedBy: "/").last ?? ""))
+        })
     }
 }
 
@@ -688,6 +803,11 @@ final class Model: ObservableObject {
     private var ghostPings: [String: Date] = ((UserDefaults.standard.dictionary(forKey: "ghostPings") as? [String: Double]) ?? [:])
         .mapValues { Date(timeIntervalSince1970: $0) }
     @Published var junk: [Junk] = []
+    @Published var space: [(url: URL, bytes: Double)]? = nil
+    @Published var measuring = false
+    @Published var verdicts: [Verdict]? = nil
+    @Published var asking = false
+    @Published var aiError: String? = nil
     @Published var diskFree = 0.0
     var diskTotal = 0.0
     private var lastDiskScan: Date?
@@ -837,11 +957,34 @@ final class Model: ObservableObject {
               diskPing.map({ now.timeIntervalSince($0) > 12 * 3600 }) ?? true else { return }
         diskPing = now
         let title = "💾 Disk almost full · \(size(diskFree)) left"
-        if let j = junk.first(where: { $0.blockedBy == nil }) {
+        if let j = junk.first(where: { $0.blockedBy == nil && $0.pingable }) {
             Notifier.shared.post(title, "\(size(junk.reduce(0) { $0 + $1.bytes })) of dev junk you can clear", "\(j.title): \(j.detail)",
                                  button: "Clear \(size(j.bytes))") { self.clean(j.id) }
         } else {
             Notifier.shared.post(title, "", "open baa to see what you can clear")
+        }
+    }
+
+    func measureSpace() {
+        measuring = true
+        dq.async {
+            let s = Disk.space()
+            DispatchQueue.main.async {
+                self.space = s; self.measuring = false
+                if AI.cli() != nil && !s.isEmpty { self.askAI() }
+            }
+        }
+    }
+
+    func askAI() {
+        guard let s = space else { return }
+        asking = true; aiError = nil
+        dq.async {
+            let r = AI.ask(s)
+            DispatchQueue.main.async {
+                self.asking = false
+                switch r { case .success(let v): self.verdicts = v; case .failure(let e): self.aiError = e.msg }
+            }
         }
     }
 
@@ -983,6 +1126,43 @@ struct Spark: View {
 }
 
 // MARK: - menu
+
+struct SpaceCard<Content: View>: View {
+    let title: String, total: Double?
+    @ViewBuilder let content: Content
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(title).font(.system(size: 12, weight: .semibold))
+                Spacer()
+                if let total, total > 0 { Text(size(total)).font(.system(size: 12, weight: .bold, design: .rounded)).monospacedDigit() }
+            }
+            .padding(.horizontal, 8).padding(.bottom, 4)
+            content
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.accentColor.opacity(0.06)))
+    }
+}
+
+struct SpaceRow: View {
+    let name: String, bytes: Double, url: URL, why: String
+    @State private var hover = false
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(name).font(.system(size: 12)).lineLimit(1).truncationMode(.middle)
+            Spacer(minLength: 6)
+            if bytes > 0 { Text(size(bytes)).font(.system(size: 11)).foregroundStyle(.secondary).monospacedDigit() }
+            Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold)).foregroundStyle(.tertiary).opacity(hover ? 1 : 0)
+        }
+        .padding(.horizontal, 8).padding(.vertical, 5)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(hover ? 0.06 : 0)))
+        .contentShape(Rectangle())
+        .onHover { hover = $0 }
+        .onTapGesture { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+        .help(why)
+    }
+}
 
 struct Section_<Content: View>: View {
     let title: String, trailing: String?
@@ -1295,6 +1475,51 @@ struct MenuView: View {
                 }
             }
         }
+        spaceList
+    }
+
+    // the junk list only knows safe dev caches. this finds where the rest went, so a full disk is never a mystery.
+    // one tap: measure the big folders, then (if there's a claude / pi CLI) ask which are safe. calm on purpose
+    @ViewBuilder var spaceList: some View {
+        let ai = AI.cli()
+        if let v = m.verdicts {
+            let known = Set(m.junk.flatMap { j -> [String] in if case .trash(let u) = j.action { return u.map(\.path) }; return [] })
+            let safe = v.filter { $0.kind == "safe" && !known.contains($0.url.path) }.prefix(5), rest = v.filter { $0.kind != "safe" }.count
+            SpaceCard(title: "✨ Safe to delete", total: safe.reduce(0) { $0 + $1.bytes }) {
+                ForEach(safe) { d in SpaceRow(name: d.name, bytes: d.bytes, url: d.url, why: d.why) }
+                if safe.isEmpty { Text("nothing that's clearly safe").font(.system(size: 11)).foregroundStyle(.secondary).padding(.vertical, 4) }
+            }
+            Text((rest > 0 ? "\(rest) more are yours or apps need them · " : "") + "click one to open it")
+                .font(.system(size: 10)).foregroundStyle(.tertiary).frame(maxWidth: .infinity)
+        } else if let s = m.space, !m.asking {
+            SpaceCard(title: "Biggest folders", total: nil) {
+                ForEach(Array(s.prefix(5).enumerated()), id: \.offset) { _, d in SpaceRow(name: spaceName(d.url), bytes: d.bytes, url: d.url, why: d.url.path) }
+                if s.isEmpty { Text("no big folders in your home · the rest is macOS and apps").font(.system(size: 11)).foregroundStyle(.secondary).padding(.vertical, 4) }
+            }
+            if let e = m.aiError { Text(e).font(.system(size: 10)).foregroundStyle(.orange).frame(maxWidth: .infinity) }
+        } else {
+            let busy = m.measuring || m.asking
+            Button { m.measureSpace() } label: {
+                HStack(spacing: 8) {
+                    if busy { ProgressView().controlSize(.small) }
+                    Text(m.asking ? "asking \(ai?.name ?? "AI") what's safe…" : m.measuring ? "measuring your folders…" : "✨  Find more space")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                .frame(maxWidth: .infinity).padding(.vertical, 10)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Color.accentColor.opacity(0.08)))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain).disabled(busy)
+            if let ai, !busy {
+                Text("only folder names + sizes go to \(ai.name) · it never deletes")
+                    .font(.system(size: 10)).foregroundStyle(.tertiary).multilineTextAlignment(.center).frame(maxWidth: .infinity)
+            }
+        }
+    }
+
+    func spaceName(_ u: URL) -> String {
+        let rel = u.path.replacingOccurrences(of: Disk.home.path + "/", with: "")
+        return rel == ".Trash" ? "🗑 Trash (empty it to get this back)" : rel.replacingOccurrences(of: "/", with: " › ")
     }
 }
 
@@ -1496,7 +1721,21 @@ enum CLI {
         let fill = used / 5
         print("\n  \(b)DISK\(r)  \(size(free)) free of \(size(total))")
         print("  \(String(repeating: "█", count: fill))\(g)\(String(repeating: "░", count: 20 - fill))\(r)  \(b)\(used)% used\(r)\n")
-        if junk.isEmpty { print("  no dev junk piling up ✨\n"); return }
+        if rest.first == "space" {
+            print("  \(b)what's using your space\(r)  \(g)· folders over 1 GB\(r)")
+            let sp = Disk.space()
+            for d in sp.prefix(12) { print("  \(size(d.bytes).padding(toLength: 9, withPad: " ", startingAt: 0)) \(d.url.path.replacingOccurrences(of: Disk.home.path, with: "~"))") }
+            if rest.contains("--ai") {
+                print("\n  \(b)ai's take\(r)  \(g)· asking \(AI.cli()?.name ?? "nobody") (names + sizes only)…\(r)")
+                switch AI.ask(sp) {
+                case .failure(let e): print("  \(e.msg)")
+                case .success(let v):
+                    for d in v { print("  \(d.chip)  \(b)\(d.url.path.replacingOccurrences(of: Disk.home.path, with: "~"))\(r) \(d.bytes > 0 ? size(d.bytes) : "")\n     \(g)\(d.why)\(r)") }
+                }
+            } else if AI.cli() != nil { print("\n  \(g)baa disk space --ai asks AI which of these are safe to delete\(r)") }
+            print(""); return
+        }
+        if junk.isEmpty { print("  no dev junk piling up ✨  \(g)(baa disk space shows what is using it)\(r)\n"); return }
         print("  \(b)dev junk\(r)  \(g)· \(size(junk.reduce(0) { $0 + $1.bytes })) you can clear\(r)")
         for j in junk {
             print("  \(j.icon) \(b)\(j.title)\(r)  \(size(j.bytes))")

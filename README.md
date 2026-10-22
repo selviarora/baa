@@ -27,6 +27,7 @@ turns out most of my RAM wasn't going to apps i had open. it was mostly dev serv
 - tells you how much RAM you'd get back, and frees it in one click
 - pings you a few minutes before you run out
 - also finds dev junk filling up your disk (old builds, package caches etc.) and trashes it in one click
+- ✨ find more space: shows your biggest folders and (if you have claude code or pi) asks AI which ones are safe to delete. only folder names + sizes are sent, and it never deletes anything
 
 
 ## install
@@ -61,6 +62,7 @@ that builds the app into `~/Applications`, starts it when you log in, and adds t
 | `baa free all` | free everything it found |
 | `baa disk` | dev junk taking up your disk |
 | `baa disk clean <id>` | clear one (or `all`) |
+| `baa disk space` | your biggest folders (add `--ai` to ask which are safe to delete) |
 | `baa warn 20 10` | go 🟡 at 20% free and 🔴 at 10% (or tap the sliders icon in the panel) |
 | `baa test` | send a sample notification |
 
